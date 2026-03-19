@@ -301,11 +301,22 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", 65_536))
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
+INT8_GROUP_SIZE = int(os.environ.get("INT8_GROUP_SIZE", 64))
+INT8_CLIP_PERCENTILE = float(os.environ.get("INT8_CLIP_PERCENTILE", 99.99984))
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_OUTLIER_COLS = int(os.environ.get("INT8_OUTLIER_COLS", 0))
+INT8_OUTLIER_MIN_ROWS = int(os.environ.get("INT8_OUTLIER_MIN_ROWS", 256))
+INT8_OUTLIER_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "INT8_OUTLIER_NAME_PATTERNS",
+        "tok_emb,lm_head,c_q,c_k,c_v,proj,fc",
+    ).split(",")
+    if pattern
+)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -318,26 +329,66 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def maybe_extract_outlier_columns(name: str, t32: Tensor) -> tuple[Tensor, dict[str, Tensor] | None]:
+    if (
+        INT8_OUTLIER_COLS <= 0
+        or t32.ndim != 2
+        or t32.shape[0] < INT8_OUTLIER_MIN_ROWS
+        or t32.shape[1] <= INT8_OUTLIER_COLS
+        or not any(pattern in name for pattern in INT8_OUTLIER_NAME_PATTERNS)
+    ):
+        return t32, None
+    col_score = t32.square().mean(dim=0)
+    topk = min(INT8_OUTLIER_COLS, int(col_score.numel()))
+    if topk <= 0:
+        return t32, None
+    idx = torch.topk(col_score, k=topk, largest=True, sorted=True).indices.to(dtype=torch.int32)
+    keep = t32[:, idx].to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+    work = t32.clone()
+    work[:, idx] = 0.0
+    return work, {"indices": idx.contiguous(), "values": keep}
+
+
+def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor, dict[str, Tensor] | None]:
     t32 = t.float()
+    outlier_cols: dict[str, Tensor] | None = None
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
+        t32, outlier_cols = maybe_extract_outlier_columns(name, t32)
+        # Matrices use groupwise per-row scales over the input dimension. This keeps
+        # the int8 payload size unchanged while spending a small amount of extra
+        # scale metadata to reduce quantization error on especially sensitive layers
+        # like embeddings and projection matrices.
+        rows, cols = t32.shape
+        group_size = max(INT8_GROUP_SIZE, 1)
+        if cols % group_size == 0:
+            groups = cols // group_size
+            view = t32.view(rows, groups, group_size)
+            clip_abs = (
+                torch.quantile(view.abs(), INT8_CLIP_Q, dim=2)
+                if t32.numel()
+                else torch.empty((rows, groups), dtype=torch.float32)
+            )
+            scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+            clipped = torch.maximum(torch.minimum(view, clip_abs[..., None]), -clip_abs[..., None])
+            q = torch.clamp(torch.round(clipped / scale[..., None]), -127, 127).to(torch.int8).contiguous()
+            return q.view(rows, cols), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), outlier_cols
+
+        # Fallback for matrices whose width is not divisible by the requested group size.
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
             if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
+            else torch.empty((rows,), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
         scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
         q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), outlier_cols
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
+    return q, scale, None
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -351,8 +402,17 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
+    outlier_cols: dict[str, dict[str, Tensor]] = {}
     stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        (
+            "param_count",
+            "num_tensors",
+            "num_float_tensors",
+            "num_nonfloat_tensors",
+            "baseline_tensor_bytes",
+            "int8_payload_bytes",
+            "outlier_col_bytes",
+        ),
         0,
     )
 
@@ -377,13 +437,20 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
+        q, s, cols = quantize_float_tensor(name, t)
+        if s.ndim == 2:
+            qmeta[name] = {"scheme": "per_row_group", "axis": 0, "group_size": INT8_GROUP_SIZE}
+        elif s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        if cols is not None:
+            outlier_cols[name] = cols
+            extra_bytes = sum(tensor_nbytes(v) for v in cols.values())
+            stats["int8_payload_bytes"] += extra_bytes
+            stats["outlier_col_bytes"] += extra_bytes
 
     obj: dict[str, object] = {
         "__quant_format__": "int8_clean_per_row_v1",
@@ -394,6 +461,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     }
     if qmeta:
         obj["qmeta"] = qmeta
+    if outlier_cols:
+        obj["outlier_cols"] = outlier_cols
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
@@ -401,17 +470,34 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
+    outlier_cols = obj.get("outlier_cols", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        scheme = qmeta.get(name, {}).get("scheme")
+        if scheme == "per_row_group" and s.ndim == 2:
+            group_size = int(qmeta.get(name, {}).get("group_size", q.shape[1]))
+            rows, cols = q.shape
+            groups = s.shape[1]
+            if groups * group_size != cols:
+                raise ValueError(
+                    f"Grouped scale metadata mismatch for {name}: groups={groups} group_size={group_size} cols={cols}"
+                )
+            qf = q.float().view(rows, groups, group_size)
+            sf = s.to(dtype=torch.float32)[..., None]
+            out_t = (qf * sf).view(rows, cols).to(dtype=dtype).contiguous()
+        elif scheme == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             # Broadcast the saved row scale back across trailing dimensions.
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+            out_t = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+            out_t = (q.float() * scale).to(dtype=dtype).contiguous()
+        cols = outlier_cols.get(name)
+        if cols is not None:
+            out_t[:, cols["indices"].long()] = cols["values"].to(dtype=dtype)
+        out[name] = out_t
     for name, t in obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
@@ -1087,7 +1173,8 @@ def main() -> None:
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"(payload:{quant_stats['int8_payload_bytes']} outlier_cols:{quant_stats['outlier_col_bytes']} "
+            f"raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
